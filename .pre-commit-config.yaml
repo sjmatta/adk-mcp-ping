@@ -1,0 +1,70 @@
+# Pre-commit configuration for adk-mcp-ping
+# Install: pre-commit install && pre-commit install --hook-type pre-push
+# Run all: pre-commit run --all-files
+
+default_language_version:
+  python: python3.12
+
+repos:
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: debug-statements
+      - id: check-case-conflict
+
+  # Ruff - linting and formatting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  # Type checking with mypy (pre-push only for speed)
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        files: ^src/
+        stages: [pre-push]
+        pass_filenames: false
+        args: [src/adk_mcp_ping]
+
+  # Dependency checking with deptry (pre-push only)
+  - repo: local
+    hooks:
+      - id: deptry
+        name: deptry
+        entry: uv run deptry
+        language: system
+        always_run: true
+        stages: [pre-push]
+        pass_filenames: false
+        args: [src]
+
+  # Run tests (pre-push only)
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        always_run: true
+        stages: [pre-push]
+        pass_filenames: false
+        args: [--tb=short, -q]
+
+ci:
+  autofix_commit_msg: "style: auto-fix by pre-commit hooks"
+  autoupdate_commit_msg: "chore: update pre-commit hooks"
