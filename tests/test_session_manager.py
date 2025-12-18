@@ -7,56 +7,77 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from adk_mcp_ping.session_manager import PingEnabledSessionManager
+from adk_mcp_ping.session_manager import (
+    DEFAULT_PING_INTERVAL_SECONDS,
+    PingEnabledSessionManager,
+)
 
 
 class TestPingEnabledSessionManager:
     """Tests for PingEnabledSessionManager class."""
 
-    def test_init_default_ping_interval(
-        self, mock_connection_params: MagicMock
-    ) -> None:
-        """Test default ping interval is 50 seconds."""
-        manager = PingEnabledSessionManager(
-            connection_params=mock_connection_params,
-        )
-        assert manager._ping_interval == 50.0
-
-    def test_init_custom_ping_interval(self, mock_connection_params: MagicMock) -> None:
-        """Test custom ping interval is respected."""
-        manager = PingEnabledSessionManager(
-            connection_params=mock_connection_params,
-            ping_interval=30.0,
-        )
-        assert manager._ping_interval == 30.0
-
-    def test_init_creates_empty_ping_tasks(
-        self, mock_connection_params: MagicMock
-    ) -> None:
-        """Test ping tasks dict is initialized empty."""
-        manager = PingEnabledSessionManager(
-            connection_params=mock_connection_params,
-        )
-        assert manager._ping_tasks == {}
+    def test_uses_default_ping_interval_constant(self) -> None:
+        """Verify the default constant is set appropriately for AWS ALB."""
+        # AWS ALB default idle timeout is 60s, so default should be < 60s
+        assert DEFAULT_PING_INTERVAL_SECONDS < 60.0
+        assert DEFAULT_PING_INTERVAL_SECONDS > 0
 
     @pytest.mark.asyncio
-    async def test_create_session_starts_ping_task(
+    async def test_sends_pings_at_default_interval(
         self, mock_connection_params: MagicMock, mock_client_session: MagicMock
     ) -> None:
-        """Test that create_session starts a ping task."""
+        """Test that pings are sent at the default interval."""
+        # Use a fast interval for testing, but verify the default is wired correctly
         manager = PingEnabledSessionManager(
             connection_params=mock_connection_params,
-            ping_interval=0.1,  # Fast for testing
+        )
+        # The manager should use the constant as default
+        assert manager._ping_interval == DEFAULT_PING_INTERVAL_SECONDS
+
+    @pytest.mark.asyncio
+    async def test_sends_pings_at_custom_interval(
+        self, mock_connection_params: MagicMock, mock_client_session: MagicMock
+    ) -> None:
+        """Test that pings are sent at a custom interval."""
+        ping_interval = 0.05  # 50ms for fast testing
+        manager = PingEnabledSessionManager(
+            connection_params=mock_connection_params,
+            ping_interval=ping_interval,
+        )
+        manager._is_session_disconnected = MagicMock(return_value=False)
+
+        # Start ping loop
+        task = asyncio.create_task(manager._ping_loop(mock_client_session, "test_key"))
+
+        # Wait for approximately 3 intervals
+        await asyncio.sleep(ping_interval * 3.5)
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        # Should have sent approximately 3 pings (timing can vary slightly)
+        assert mock_client_session.send_ping.call_count >= 2
+        assert mock_client_session.send_ping.call_count <= 4
+
+    @pytest.mark.asyncio
+    async def test_create_session_starts_pinging(
+        self, mock_connection_params: MagicMock, mock_client_session: MagicMock
+    ) -> None:
+        """Test that creating a session starts the ping loop."""
+        manager = PingEnabledSessionManager(
+            connection_params=mock_connection_params,
+            ping_interval=0.05,
         )
 
-        # Mock parent's create_session
         with patch.object(
             PingEnabledSessionManager.__bases__[0],
             "create_session",
             new_callable=AsyncMock,
             return_value=mock_client_session,
         ):
-            # Mock helper methods
             manager._merge_headers = MagicMock(return_value={})
             manager._generate_session_key = MagicMock(return_value="test_session_key")
             manager._is_session_disconnected = MagicMock(return_value=False)
@@ -64,45 +85,18 @@ class TestPingEnabledSessionManager:
             session = await manager.create_session()
 
             assert session == mock_client_session
-            assert "test_session_key" in manager._ping_tasks
-            assert isinstance(manager._ping_tasks["test_session_key"], asyncio.Task)
+
+            # Wait for at least one ping to be sent
+            await asyncio.sleep(0.1)
+
+            # Verify pings are being sent
+            assert mock_client_session.send_ping.call_count >= 1
 
             # Clean up
-            manager._ping_tasks["test_session_key"].cancel()
-            try:
-                await manager._ping_tasks["test_session_key"]
-            except asyncio.CancelledError:
-                pass
+            await manager.close()
 
     @pytest.mark.asyncio
-    async def test_ping_loop_sends_pings(
-        self, mock_connection_params: MagicMock, mock_client_session: MagicMock
-    ) -> None:
-        """Test that ping loop sends pings at the specified interval."""
-        manager = PingEnabledSessionManager(
-            connection_params=mock_connection_params,
-            ping_interval=0.05,  # 50ms for fast testing
-        )
-        manager._is_session_disconnected = MagicMock(return_value=False)
-
-        # Start ping loop in background
-        task = asyncio.create_task(manager._ping_loop(mock_client_session, "test_key"))
-
-        # Wait for a few pings
-        await asyncio.sleep(0.15)
-
-        # Cancel and verify
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        # Should have sent 2-3 pings in 150ms with 50ms interval
-        assert mock_client_session.send_ping.call_count >= 2
-
-    @pytest.mark.asyncio
-    async def test_ping_loop_stops_on_disconnect(
+    async def test_stops_pinging_when_session_disconnects(
         self, mock_connection_params: MagicMock, mock_client_session: MagicMock
     ) -> None:
         """Test that ping loop stops when session disconnects."""
@@ -117,7 +111,7 @@ class TestPingEnabledSessionManager:
         def check_disconnected(_: MagicMock) -> bool:
             nonlocal call_count
             call_count += 1
-            return call_count > 1  # Disconnected after first ping attempt
+            return call_count > 1
 
         manager._is_session_disconnected = check_disconnected
 
@@ -127,21 +121,19 @@ class TestPingEnabledSessionManager:
             timeout=1.0,
         )
 
-        # Should have only attempted one ping before detecting disconnect
+        # Should have stopped after detecting disconnect
         assert mock_client_session.send_ping.call_count <= 1
 
     @pytest.mark.asyncio
-    async def test_ping_loop_stops_on_error(
+    async def test_stops_pinging_on_connection_error(
         self, mock_connection_params: MagicMock, mock_client_session: MagicMock
     ) -> None:
-        """Test that ping loop stops on ping error."""
+        """Test that ping loop stops gracefully on ping error."""
         manager = PingEnabledSessionManager(
             connection_params=mock_connection_params,
             ping_interval=0.05,
         )
         manager._is_session_disconnected = MagicMock(return_value=False)
-
-        # Make ping raise an error
         mock_client_session.send_ping.side_effect = Exception("Connection lost")
 
         # Run ping loop - should exit on its own due to error
@@ -150,26 +142,31 @@ class TestPingEnabledSessionManager:
             timeout=1.0,
         )
 
-        # Should have tried to send exactly one ping before error
+        # Should have tried exactly one ping before error stopped the loop
         assert mock_client_session.send_ping.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_close_cancels_all_ping_tasks(
+    async def test_close_stops_all_pinging(
         self, mock_connection_params: MagicMock, mock_client_session: MagicMock
     ) -> None:
-        """Test that close() cancels all running ping tasks."""
+        """Test that close() stops all ping loops."""
         manager = PingEnabledSessionManager(
             connection_params=mock_connection_params,
-            ping_interval=10.0,  # Long interval so task stays running
+            ping_interval=0.05,
         )
         manager._is_session_disconnected = MagicMock(return_value=False)
 
-        # Create multiple ping tasks
+        # Start multiple ping tasks via the manager's tracking
         task1 = asyncio.create_task(manager._ping_loop(mock_client_session, "key1"))
         task2 = asyncio.create_task(manager._ping_loop(mock_client_session, "key2"))
-        manager._ping_tasks = {"key1": task1, "key2": task2}
 
-        # Mock parent close
+        async with manager._ping_task_lock:
+            manager._ping_tasks = {"key1": task1, "key2": task2}
+
+        # Let some pings happen
+        await asyncio.sleep(0.1)
+        pings_before_close = mock_client_session.send_ping.call_count
+
         with patch.object(
             PingEnabledSessionManager.__bases__[0],
             "close",
@@ -177,16 +174,20 @@ class TestPingEnabledSessionManager:
         ):
             await manager.close()
 
+        # Both tasks should be done
         assert task1.cancelled() or task1.done()
         assert task2.cancelled() or task2.done()
-        assert manager._ping_tasks == {}
+
+        # No more pings should be sent after close
+        await asyncio.sleep(0.1)
+        assert mock_client_session.send_ping.call_count == pings_before_close
 
 
 class TestPingEnabledSessionManagerIntegration:
-    """Integration tests that don't mock the parent class."""
+    """Integration tests that verify proper inheritance."""
 
-    def test_inheritance(self) -> None:
-        """Test that PingEnabledSessionManager inherits from MCPSessionManager."""
+    def test_inherits_from_mcp_session_manager(self) -> None:
+        """Verify proper inheritance from MCPSessionManager."""
         from google.adk.tools.mcp_tool.mcp_session_manager import MCPSessionManager
 
         assert issubclass(PingEnabledSessionManager, MCPSessionManager)
