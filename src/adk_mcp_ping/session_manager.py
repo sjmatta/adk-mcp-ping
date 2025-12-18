@@ -26,7 +26,11 @@ if TYPE_CHECKING:
         | StreamableHTTPConnectionParams
     )
 
-logger = logging.getLogger("adk_mcp_ping." + __name__)
+logger = logging.getLogger(__name__)
+
+# AWS ALB default idle timeout is 60s; ping before that to keep connections alive
+DEFAULT_PING_INTERVAL_SECONDS = 50.0
+SESSION_KEY_LOG_LENGTH = 8
 
 
 class PingEnabledSessionManager(MCPSessionManager):
@@ -44,16 +48,15 @@ class PingEnabledSessionManager(MCPSessionManager):
     def __init__(
         self,
         connection_params: ConnectionParams,
-        ping_interval: float = 50.0,
+        ping_interval: float = DEFAULT_PING_INTERVAL_SECONDS,
         errlog: TextIO = sys.stderr,
     ) -> None:
         """Initialize the ping-enabled session manager.
 
         Args:
             connection_params: Parameters for the MCP connection.
-            ping_interval: Interval in seconds between pings. Default 50s
-                          (suitable for AWS ALB's 60s default timeout).
-            errlog: TextIO stream for error logging.
+            ping_interval: Seconds between keep-alive pings.
+            errlog: Stream for error logging.
         """
         super().__init__(connection_params=connection_params, errlog=errlog)
         self._ping_interval = ping_interval
@@ -63,103 +66,100 @@ class PingEnabledSessionManager(MCPSessionManager):
     async def create_session(
         self, headers: dict[str, str] | None = None
     ) -> ClientSession:
-        """Create a session and start a ping task for it.
-
-        Args:
-            headers: Optional headers to include in the session.
-
-        Returns:
-            ClientSession: The initialized MCP client session.
-        """
-        # Call parent to create/get the session
+        """Create a session and start a ping task for it."""
         session = await super().create_session(headers=headers)
+        session_key = self._get_session_key(headers)
+        await self._start_ping_task_if_needed(session, session_key)
+        return session
 
-        # Generate the session key to track the ping task
+    def _get_session_key(self, headers: dict[str, str] | None) -> str:
+        """Generate the session key from headers."""
         merged_headers = self._merge_headers(headers)
-        session_key = self._generate_session_key(merged_headers)
+        return self._generate_session_key(merged_headers)
 
-        # Start ping task if not already running for this session
+    def _short_key(self, session_key: str) -> str:
+        """Return truncated session key for logging."""
+        return session_key[:SESSION_KEY_LOG_LENGTH]
+
+    async def _start_ping_task_if_needed(
+        self, session: ClientSession, session_key: str
+    ) -> None:
+        """Start a ping task for the session if one isn't already running."""
         async with self._ping_task_lock:
             if session_key not in self._ping_tasks:
                 task = asyncio.create_task(
                     self._ping_loop(session, session_key),
-                    name=f"ping_loop_{session_key[:8]}",
+                    name=f"ping_loop_{self._short_key(session_key)}",
                 )
                 self._ping_tasks[session_key] = task
                 logger.debug(
                     "Started ping task for session %s (interval: %.1fs)",
-                    session_key[:8],
+                    self._short_key(session_key),
                     self._ping_interval,
                 )
 
-        return session
-
     async def _ping_loop(self, session: ClientSession, session_key: str) -> None:
-        """Background task that sends periodic pings to keep the connection alive.
-
-        Args:
-            session: The MCP client session to ping.
-            session_key: Key identifying this session for logging.
-        """
+        """Send periodic pings until the session disconnects or is cancelled."""
+        short_key = self._short_key(session_key)
         ping_count = 0
-        while True:
-            try:
+
+        try:
+            while True:
                 await asyncio.sleep(self._ping_interval)
 
-                # Check if session is still connected
                 if self._is_session_disconnected(session):
-                    logger.debug(
-                        "Session %s disconnected, stopping ping loop",
-                        session_key[:8],
-                    )
+                    logger.debug("Session %s disconnected, stopping pings", short_key)
                     break
 
-                # Send ping
                 ping_count += 1
                 await session.send_ping()
-                logger.debug(
-                    "Ping #%d sent for session %s",
-                    ping_count,
-                    session_key[:8],
-                )
+                logger.debug("Ping #%d sent for session %s", ping_count, short_key)
 
-            except asyncio.CancelledError:
-                logger.debug(
-                    "Ping loop cancelled for session %s after %d pings",
-                    session_key[:8],
-                    ping_count,
-                )
-                raise
-            except Exception as e:
-                # Log error but don't crash - session might be closing
-                logger.debug(
-                    "Ping failed for session %s: %s",
-                    session_key[:8],
-                    e,
-                )
-                break
+        except asyncio.CancelledError:
+            logger.debug(
+                "Ping loop cancelled for session %s after %d pings",
+                short_key,
+                ping_count,
+            )
+            raise
+        except Exception as e:
+            logger.debug("Ping failed for session %s: %s", short_key, e)
+        finally:
+            await self._cleanup_ping_task(session_key)
 
-        # Clean up task reference
+    async def _cleanup_ping_task(self, session_key: str) -> None:
+        """Remove the ping task reference for a session."""
         async with self._ping_task_lock:
             self._ping_tasks.pop(session_key, None)
 
     async def close(self) -> None:
-        """Close all sessions and cancel all ping tasks."""
-        # Cancel all ping tasks first
+        """Cancel all ping tasks and close sessions."""
+        await self._cancel_all_ping_tasks()
+        await super().close()  # type: ignore[no-untyped-call]
+
+    async def _cancel_all_ping_tasks(self) -> None:
+        """Cancel and await all running ping tasks."""
+        # Take snapshot and clear under lock to avoid deadlock with _cleanup_ping_task
         async with self._ping_task_lock:
-            for session_key, task in list(self._ping_tasks.items()):
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.warning(
-                        "Error cancelling ping task for %s: %s",
-                        session_key[:8],
-                        e,
-                    )
+            tasks_to_cancel = list(self._ping_tasks.items())
             self._ping_tasks.clear()
 
-        # Then close sessions via parent
-        await super().close()  # type: ignore[no-untyped-call]
+        # Cancel and await outside the lock
+        for session_key, task in tasks_to_cancel:
+            task.cancel()
+            await self._await_task_cancellation(task, session_key)
+
+    async def _await_task_cancellation(
+        self, task: asyncio.Task[Any], session_key: str
+    ) -> None:
+        """Await a cancelled task, logging any unexpected errors."""
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(
+                "Error cancelling ping task for %s: %s",
+                self._short_key(session_key),
+                e,
+            )

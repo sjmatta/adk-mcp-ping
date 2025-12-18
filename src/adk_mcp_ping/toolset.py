@@ -7,7 +7,10 @@ from typing import TYPE_CHECKING
 
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 
-from .session_manager import PingEnabledSessionManager
+from .session_manager import (
+    DEFAULT_PING_INTERVAL_SECONDS,
+    PingEnabledSessionManager,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,7 +78,7 @@ class PingEnabledMcpToolset(McpToolset):
         self,
         *,
         connection_params: ConnectionParams,
-        ping_interval: float = 50.0,
+        ping_interval: float = DEFAULT_PING_INTERVAL_SECONDS,
         tool_filter: list[str] | Callable[..., bool] | None = None,
         tool_name_prefix: str | None = None,
         errlog: TextIO = sys.stderr,
@@ -87,12 +90,6 @@ class PingEnabledMcpToolset(McpToolset):
         """Initialize the ping-enabled MCP toolset."""
         self._ping_interval = ping_interval
 
-        # Store params before calling super().__init__
-        # because we need to replace the session manager after
-        self._connection_params = connection_params
-        self._errlog = errlog
-
-        # Call parent init - this creates the default MCPSessionManager
         super().__init__(
             connection_params=connection_params,
             tool_filter=tool_filter,
@@ -104,7 +101,7 @@ class PingEnabledMcpToolset(McpToolset):
             header_provider=header_provider,
         )
 
-        # Replace with our ping-enabled session manager
+        # Replace the default session manager with our ping-enabled version
         self._mcp_session_manager = PingEnabledSessionManager(
             connection_params=connection_params,
             ping_interval=ping_interval,
